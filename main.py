@@ -1,10 +1,12 @@
-import requests
 import json
 import time
 import os
 from datetime import datetime, timezone
+import requests
+import feedparser
 from groq import Groq
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,60 +20,81 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
+# No Reddit authentication needed - using public RSS feeds
+
 # Initialize API clients
 groq_client = Groq(api_key=GROQ_API_KEY)
-genai.configure(api_key=GEMINI_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-headers = {
-    "User-Agent": "SubSignalBot/0.1 (by u/This-Ad-9658)"
-}
+# User agent for RSS requests
+USER_AGENT = "SubSignalBot/2.0 (Startup Idea Analyzer)"
 
 def fetch_reddit_posts():
-    """Fetch top 5 posts from last 24 hours for each subreddit."""
+    """Fetch posts from subreddits using public RSS feeds."""
     all_data = {}
     now_ts = int(datetime.now(timezone.utc).timestamp())
-
+    
+    headers = {'User-Agent': USER_AGENT}
+    
     for sub in subreddits:
         try:
             print(f"Fetching posts from r/{sub}...")
-            url = f"https://www.reddit.com/r/{sub}/new.json?limit=50"
-            response = requests.get(url, headers=headers)
+            
+            # Use Reddit's public RSS feed (no authentication required)
+            rss_url = f"https://www.reddit.com/r/{sub}/new/.rss?limit=50"
+            
+            response = requests.get(rss_url, headers=headers, timeout=10)
             response.raise_for_status()
-            posts = response.json()["data"]["children"]
-
-            # Filter posts from last 24 hours
+            
+            # Parse RSS feed
+            feed = feedparser.parse(response.content)
+            
             recent_posts = []
-            for post in posts:
-                post_data_raw = post["data"]
-                created_utc = post_data_raw["created_utc"]
-                if now_ts - created_utc <= 24*3600:
-                    recent_posts.append(post_data_raw)
-
-            # Sort by score descending
-            recent_posts.sort(key=lambda x: x["score"], reverse=True)
-
-            # Take top 5
-            top_posts = recent_posts[:5]
-
-            subreddit_posts = []
-            for data in top_posts:
-                post_data = {
-                    "title": data["title"],
-                    "body": data.get("selftext", "")[:500],  # Limit body length
-                    "score": data["score"],
-                    "url": f"https://reddit.com{data['permalink']}",
-                    "num_comments": data.get("num_comments", 0)
-                }
-                subreddit_posts.append(post_data)
-                time.sleep(1)
-
-            all_data[sub] = subreddit_posts
-            time.sleep(2)
-
-        except Exception as e:
+            for entry in feed.entries:
+                # Parse published time
+                try:
+                    from time import mktime
+                    from email.utils import parsedate
+                    
+                    published_ts = mktime(entry.published_parsed) if hasattr(entry, 'published_parsed') else 0
+                    
+                    # Filter posts from last 24 hours
+                    if now_ts - published_ts <= 24*3600:
+                        # Extract text content (RSS gives HTML)
+                        content = entry.get('content', [{}])[0].get('value', '') if 'content' in entry else entry.get('summary', '')
+                        
+                        # Clean HTML tags
+                        import re
+                        clean_content = re.sub('<[^<]+?>', '', content)
+                        
+                        recent_posts.append({
+                            "title": entry.title,
+                            "body": clean_content[:500] if clean_content else "",
+                            "score": 0,  # RSS doesn't provide scores
+                            "url": entry.link,
+                            "num_comments": 0,  # RSS doesn't provide comment counts
+                            "created_utc": published_ts
+                        })
+                except Exception as e:
+                    print(f"  ⚠ Error parsing entry: {e}")
+                    continue
+            
+            # Take most recent posts (since we can't sort by score from RSS)
+            recent_posts = recent_posts[:5]  # Get more since we can't filter by score
+            
+            all_data[sub] = recent_posts
+            print(f"  ✓ Found {len(recent_posts)} posts from last 24 hours")
+            
+            # Be respectful with rate limiting
+            time.sleep(3)
+            
+        except requests.exceptions.RequestException as e:
             print(f"Error fetching from r/{sub}: {e}")
             all_data[sub] = []
-
+        except Exception as e:
+            print(f"Unexpected error for r/{sub}: {e}")
+            all_data[sub] = []
+    
     return all_data
 
 def prepare_groq_prompt(posts, subreddit):
@@ -209,8 +232,14 @@ def ask_gemini_rank_ideas(selected_ideas):
   "overall_analysis": "<summary of all ideas and market trends>"
 }"""
         
-        model = genai.GenerativeModel('gemini-2.5-flash')
-        response = model.generate_content(prompt)
+        response = gemini_client.models.generate_content(
+            model='gemini-2.0-flash-exp',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                response_mime_type='application/json'
+            )
+        )
         
         # Extract JSON from response
         response_text = response.text
@@ -394,6 +423,9 @@ def main():
         print(f'  $env:GROQ_API_KEY="your_key_here"')
         print(f'  $env:GEMINI_API_KEY="your_key_here"')
         return
+    
+    # No Reddit authentication needed - using public RSS feeds
+    print("ℹ️  Using Reddit's public RSS feeds (no authentication required)")
     
     if not DISCORD_WEBHOOK_URL:
         print("\n⚠ Warning: DISCORD_WEBHOOK_URL not set. Results won't be sent to Discord.")
